@@ -2,6 +2,7 @@
 """Block modules."""
 
 from __future__ import annotations
+import math
 
 import torch
 import torch.nn as nn
@@ -2065,3 +2066,105 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+class StarBlockSingle(nn.Module):
+    # StarNet中的基础构建块
+    def __init__(self, c1, c2):
+        super().__init__()
+        # 深度可分离卷积 (DWConv)
+        self.dwconv1 = nn.Conv2d(c1, c1, kernel_size=3, padding=1, groups=c1)
+        # 全连接层分支 (用1x1卷积实现)
+        self.fc1 = nn.Conv2d(c1, c1, kernel_size=1)
+        self.fc2 = nn.Conv2d(c1, c1, kernel_size=1)
+        self.fc3 = nn.Conv2d(c1, c1, kernel_size=1)
+        self.dwconv2 = nn.Conv2d(c1, c2, kernel_size=3, padding=1, groups=1)
+
+    def forward(self, x):
+        out = self.dwconv1(x)
+        # Star Operation: 两个分支的元素级相乘
+        out = self.fc1(out) * self.fc2(out) 
+        out = self.fc3(out)
+        out = self.dwconv2(out)
+        return out
+
+
+# 2. YOLO 解析包装器：负责处理重复次数 n 和其他潜在参数
+class StarBlock(nn.Module):
+    """
+    接收 YOLO 的参数并重复堆叠基础模块
+    """
+    # 增加 n=1 以及 *args, **kwargs 来吸收 YOLO 传进来的额外参数，彻底解决报错
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, *args, **kwargs):
+        super().__init__()
+        
+        # 使用 nn.Sequential 将 StarBlockSingle 堆叠 n 次
+        # 关键点：如果是第一层 (i==0)，输入通道是 c1，输出是 c2
+        # 如果是后面的层 (i>0)，输入通道和输出通道都是 c2，保持维度不变
+        self.m = nn.Sequential(*(
+            StarBlockSingle(c1 if i == 0 else c2, c2) for i in range(n)
+        ))
+
+    def forward(self, x):
+        # 顺次经过 n 个串联的模块
+        return self.m(x)
+class MLCA(nn.Module):
+    # 混合局部通道注意力模块
+    def __init__(self, in_channels, k_size=5):
+        super().__init__()
+        self.k_size = k_size
+        # 动态计算 1D 卷积的核大小 k [cite: 288, 289, 290]
+        t = int(abs((math.log(in_channels, 2) + 2) / 2))
+        k = t if t % 2 else t + 1
+        
+        self.lap = nn.AvgPool2d(kernel_size=k_size, stride=k_size)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k, padding=(k - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+        # Local & Global Pooling
+        local_feat = self.lap(x)
+        global_feat = self.gap(x)
+        
+        # Conv1d 处理通道特征 [cite: 286, 287]
+        global_feat = self.conv1d(global_feat.view(b, 1, c)).view(b, c, 1, 1)
+        
+        # 融合与上采样 (Unpooling) [cite: 340]
+        fused = local_feat + global_feat
+        fused = nn.functional.interpolate(fused, size=(h, w), mode='nearest')
+        
+        return x * self.sigmoid(fused)
+
+
+
+class Bottleneck_MLCA(nn.Module):
+    # 将 MLCA 嵌入到标准 Bottleneck 中 
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.mlca = MLCA(c2)  # 在卷积后接入之前写好的 MLCA 注意力层
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x):
+        # 对应论文中的 Shortcut 连接逻辑 [cite: 308, 309]
+        return x + self.mlca(self.cv2(self.cv1(x))) if self.add else self.mlca(self.cv2(self.cv1(x)))
+
+class C2f_MLCA(nn.Module):
+    # 包含 MLCA 的完整 C2f 模块 [cite: 306, 307]
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # 使用自定义的 Bottleneck_MLCA 替换原版的 Bottleneck
+        self.m = nn.ModuleList(Bottleneck_MLCA(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+
+    def forward(self, x):
+        # YoloV8 C2f 的前向传播逻辑：特征切分与多级拼接 [cite: 295, 296, 299, 300]
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
