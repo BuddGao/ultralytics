@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-
+from ultralytics.nn.modules.block import StarBlock, C2f_MLCA
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -226,6 +226,7 @@ class BaseModel(torch.nn.Module):
 
         Args:
             verbose (bool): Whether to print model information after fusion.
+
 
         Returns:
             (torch.nn.Module): The fused model is returned.
@@ -1608,6 +1609,8 @@ def parse_model(d, ch, verbose=True):
             SCDown,
             C2fCIB,
             A2C2f,
+            StarBlock,  # <--- 修改位置 1：将 StarBlock 注册到基础模块白名单
+            C2f_MLCA,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1627,6 +1630,8 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             C2PSA,
             A2C2f,
+            StarBlock, 
+            C2f_MLCA,   # <--- 修改位置 2：允许网络重复堆叠 C2f_MLCA
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
