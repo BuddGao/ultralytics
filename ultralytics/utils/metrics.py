@@ -85,27 +85,11 @@ def bbox_iou(
     GIoU: bool = False,
     DIoU: bool = False,
     CIoU: bool = False,
+    ShapeIoU: bool = False,  # <--- 新增：ShapeIoU 的开关参数
+    scale: float = 0.0,      # <--- 新增：ShapeIoU 的缩放因子参数
     eps: float = 1e-7,
 ) -> torch.Tensor:
-    """Calculate the Intersection over Union (IoU) between bounding boxes.
-
-    This function supports various shapes for `box1` and `box2` as long as the last dimension is 4. For instance, you
-    may pass tensors shaped like (4,), (N, 4), (B, N, 4), or (B, N, 1, 4). Internally, the code will split the last
-    dimension into (x, y, w, h) if `xywh=True`, or (x1, y1, x2, y2) if `xywh=False`.
-
-    Args:
-        box1 (torch.Tensor): A tensor representing one or more bounding boxes, with the last dimension being 4.
-        box2 (torch.Tensor): A tensor representing one or more bounding boxes, with the last dimension being 4.
-        xywh (bool, optional): If True, input boxes are in (x, y, w, h) format. If False, input boxes are in (x1, y1,
-            x2, y2) format.
-        GIoU (bool, optional): If True, calculate Generalized IoU.
-        DIoU (bool, optional): If True, calculate Distance IoU.
-        CIoU (bool, optional): If True, calculate Complete IoU.
-        eps (float, optional): A small value to avoid division by zero.
-
-    Returns:
-        (torch.Tensor): IoU, GIoU, DIoU, or CIoU values depending on the specified flags.
-    """
+    """Calculate the Intersection over Union (IoU) between bounding boxes."""
     # Get the coordinates of bounding boxes
     if xywh:  # transform from xywh to xyxy
         (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
@@ -128,22 +112,43 @@ def bbox_iou(
 
     # IoU
     iou = inter / union
-    if CIoU or DIoU or GIoU:
+    if CIoU or DIoU or GIoU or ShapeIoU:  # <--- 修改：将 ShapeIoU 加入判断条件
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
-        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+        if CIoU or DIoU or ShapeIoU:      # <--- 修改：将 ShapeIoU 加入判断条件
             c2 = cw.pow(2) + ch.pow(2) + eps  # convex diagonal squared
+            
+            # ================= 新增 Shape-IoU 核心逻辑 =================
+            if ShapeIoU:
+                wt = (w2 + eps) ** scale
+                ht = (h2 + eps) ** scale
+                weight_w = (2.0 * wt) / (wt + ht)
+                weight_h = (2.0 * ht) / (wt + ht)
+                
+                # 计算中心点距离的平方的组件
+                x_dist2 = ((b1_x1 + b1_x2) - (b2_x1 + b2_x2)).pow(2) / 4
+                y_dist2 = ((b1_y1 + b1_y2) - (b2_y1 + b2_y2)).pow(2) / 4
+                distance_shape = (weight_h * x_dist2 + weight_w * y_dist2) / c2
+                
+                # 计算形状惩罚项 Omega
+                omega_w = weight_w * torch.abs(w1 - w2) / torch.max(w1, w2).clamp(min=eps)
+                omega_h = weight_h * torch.abs(h1 - h2) / torch.max(h1, h2).clamp(min=eps)
+                omega_shape = (1 - torch.exp(-omega_w)) ** 4.0 + (1 - torch.exp(-omega_h)) ** 4.0
+                
+                return iou - distance_shape - 0.5 * omega_shape
+            # =========================================================
+
             rho2 = (
                 (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)
             ) / 4  # center dist**2
-            if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
+            if CIoU:  
                 v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
                 with torch.no_grad():
                     alpha = v / (v - iou + (1 + eps))
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
             return iou - rho2 / c2  # DIoU
         c_area = cw * ch + eps  # convex area
-        return iou - (c_area - union) / c_area  # GIoU https://arxiv.org/pdf/1902.09630.pdf
+        return iou - (c_area - union) / c_area  # GIoU 
     return iou  # IoU
 
 
